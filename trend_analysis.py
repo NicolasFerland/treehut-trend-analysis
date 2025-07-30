@@ -1,85 +1,76 @@
-# trend_analysis.py
-
-import os
 import re
 import warnings
-from collections import defaultdict
-from datetime import datetime
 from typing import Dict, List, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from dotenv import load_dotenv
-from sklearn.cluster import DBSCAN
+from sklearn.cluster import HDBSCAN
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.manifold import TSNE
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import normalize
+import umap
 
 warnings.simplefilter(action='ignore', category=pd.errors.SettingWithCopyWarning)
 
 def load_data(csv_path: str) -> pd.DataFrame:
-    """Load and parse a CSV file with timestamp and comment text."""
-    try:
-        df = pd.read_csv(csv_path, parse_dates=['timestamp'])
-        df = df.dropna(subset=['comment_text'])
-        return df
-    except Exception as e:
-        raise RuntimeError(f"Failed to load CSV: {e}")
+    df = pd.read_csv(csv_path, parse_dates=['timestamp'])
+    df = df.dropna(subset=['comment_text'])
+    return df
 
 def preprocess_text(text: str) -> str:
-    """Clean comment text by removing links, punctuation, and extra spaces."""
     text = text.lower()
-    text = re.sub(r'http\S+|www\S+', '', text)
-    text = re.sub(r'[^a-z\s]', '', text)
-    text = re.sub(r'\s+', ' ', text).strip()
+    text = re.sub(r"http\\S+|www\\S+", "", text)
+    text = re.sub(r"[^a-z\\s]", "", text)
+    text = re.sub(r"\\s+", " ", text).strip()
     return text
 
-def cluster_topics(df: pd.DataFrame, text_col: str) -> Tuple[pd.DataFrame, DBSCAN, TfidfVectorizer]:
-    """Cluster comments into topics using TF-IDF, TSNE, and DBSCAN."""
+def cluster_topics(df: pd.DataFrame, text_col: str) -> Tuple[pd.DataFrame, HDBSCAN, TfidfVectorizer]:
     df['clean_text'] = df[text_col].apply(preprocess_text)
-    tfidf = TfidfVectorizer(max_df=0.95, min_df=5, stop_words='english')
+    tfidf = TfidfVectorizer(max_df=0.95, min_df=3, stop_words='english')
     tfidf_matrix = tfidf.fit_transform(df['clean_text'])
 
-    reducer = TSNE(n_components=2, perplexity=30, random_state=42)
-    embeddings = reducer.fit_transform(tfidf_matrix.toarray())
+    reducer = umap.UMAP(n_components=2, n_neighbors=15, min_dist=0.1, metric='cosine'
+                        )
+    embeddings = reducer.fit_transform(tfidf_matrix)
 
-    clusterer = DBSCAN(eps=2, min_samples=5)
+    clusterer = HDBSCAN(min_cluster_size=5, metric='euclidean')
     labels = clusterer.fit_predict(embeddings)
 
     df['cluster'] = labels
     return df, clusterer, tfidf
 
-def merge_similar_clusters(
-    tfidf_matrix,
-    labels: np.ndarray,
-    similarity_threshold: float = 0.95
-) -> np.ndarray:
-    """Merge clusters whose mean TF-IDF vectors are very similar."""
-    unique_clusters = np.unique(labels[labels != -1])
+
+def merge_similar_clusters(tfidf_matrix, labels: np.ndarray, similarity_threshold: float = 0.85) -> np.ndarray:
+    unique_clusters = [c for c in np.unique(labels) if c != -1]
     cluster_vectors = []
 
     for cid in unique_clusters:
         idx = np.where(labels == cid)[0]
-        cluster_vec = tfidf_matrix[idx].mean(axis=0)
-        cluster_vectors.append(cluster_vec)
+        mean_vector = tfidf_matrix[idx].mean(axis=0)
+        cluster_vectors.append(np.asarray(mean_vector).flatten())
 
-    merged = labels.copy()
+    similarity_matrix = cosine_similarity(normalize(np.vstack(cluster_vectors)))
+
     merged_map = {}
     merged_to = {}
 
-    similarities = cosine_similarity(normalize(np.vstack(cluster_vectors)))
-
     for i, cid1 in enumerate(unique_clusters):
         for j, cid2 in enumerate(unique_clusters):
-            if i < j and similarities[i, j] > similarity_threshold:
-                merged_to[cid2] = cid1
+            if i >= j:
+                continue
+            if similarity_matrix[i, j] >= similarity_threshold:
+                target = min(cid1, cid2)
+                source = max(cid1, cid2)
+                merged_to[source] = target
 
-    for i, label in enumerate(merged):
-        if label in merged_to:
-            merged[i] = merged_to[label]
+    for c in np.unique(labels):
+        cur = c
+        while cur in merged_to:
+            cur = merged_to[cur]
+        merged_map[c] = cur
 
+    return np.array([merged_map.get(c, c) for c in labels])
 
 def get_top_terms_per_cluster(
     tfidf_matrix,
@@ -87,58 +78,54 @@ def get_top_terms_per_cluster(
     tfidf: TfidfVectorizer,
     n_terms: int = 10,
     max_clusters: int = 10,
-    min_df_ratio: float = 0.005,
-    max_df_ratio: float = 0.7
+    banned_words: List[str] = None
 ) -> Dict[int, List[str]]:
-    """
-    Extract top N keywords for each cluster, filtering low-information terms based on frequency.
+    terms = np.array(tfidf.get_feature_names_out())
+    top_clusters = pd.Series(labels).value_counts().sort_values(ascending=False).index
+    top_clusters = [cid for cid in top_clusters if cid != -1][:max_clusters]
 
-    Args:
-        tfidf_matrix: Sparse TF-IDF matrix of documents.
-        labels: Cluster labels assigned to documents.
-        tfidf: The fitted TfidfVectorizer.
-        n_terms: Number of top terms to extract per cluster.
-        max_clusters: Number of clusters to return based on frequency.
-        min_df_ratio: Minimum % of documents a word must appear in.
-        max_df_ratio: Maximum % of documents a word can appear in.
+    banned_words = set(w.lower() for w in (banned_words or []))
 
-    Returns:
-        Dictionary mapping cluster ID to a list of top terms.
-    """
-    cluster_terms = defaultdict(list)
-    terms = tfidf.get_feature_names_out()
-    label_counts = pd.Series(labels).value_counts().sort_values(ascending=False)
-    top_clusters = [cid for cid in label_counts.index if cid != -1][:max_clusters]
-
-    # Calculate term document frequencies
-    doc_freq = np.asarray((tfidf_matrix > 0).sum(axis=0)).ravel()
-    doc_count = tfidf_matrix.shape[0]
-    term_df_ratio = doc_freq / doc_count
-
-    # Filter based on DF ratio
-    valid_term_mask = (term_df_ratio >= min_df_ratio) & (term_df_ratio <= max_df_ratio)
-    valid_terms = set(terms[valid_term_mask])
-
-    seen_terms = set()
-
-    for cluster_id in top_clusters:
-        idx = np.where(labels == cluster_id)[0]
-        cluster_tfidf = tfidf_matrix[idx].mean(axis=0).A1
-        top_indices = cluster_tfidf.argsort()[::-1]
+    cluster_terms = {}
+    for cid in top_clusters:
+        idx = np.where(labels == cid)[0]
+        cluster_vector = tfidf_matrix[idx].mean(axis=0).A1
+        sorted_idx = np.argsort(cluster_vector)[::-1]
 
         keywords = []
-        for i in top_indices:
+        for i in sorted_idx:
             word = terms[i]
-            if word not in valid_terms or word in seen_terms:
+            if word in banned_words or word in keywords:
                 continue
             keywords.append(word)
-            seen_terms.add(word)
             if len(keywords) >= n_terms:
                 break
-        cluster_terms[cluster_id] = keywords
+
+        cluster_terms[cid] = keywords
 
     return cluster_terms
 
+def name_and_describe_clusters(cluster_keywords: Dict[int, List[str]]) -> Tuple[List[str], Dict[int, str]]:
+    summaries = []
+    cluster_names = {}
+    for cluster_id, words in cluster_keywords.items():
+        if not words:
+            continue
+        if len(words) == 0:
+            continue
+        if cluster_id == -1:
+            name = "Other"
+            summary = f"### Topic -1 \n **Keywords**: None \n **Name**: {name} \n"
+            summaries.append(summary)
+            cluster_names[cluster_id] = name
+            continue
+        name = " / ".join(words[:2]).title() if len(words) >= 2 else words[0].title()
+        summary = (
+            f"""### Topic {cluster_id} \n **Keywords**: {', '.join(words)} \n  \n **Name**: {name} \n"""
+        )
+        summaries.append(summary)
+        cluster_names[cluster_id] = name
+    return summaries, cluster_names
 
 def plot_trends_over_time(
     df: pd.DataFrame,
@@ -146,33 +133,26 @@ def plot_trends_over_time(
     cluster_col: str = 'cluster',
     cluster_names: Dict[int, str] = None
 ) -> None:
-    """Plot topic frequency over time."""
     df[timestamp_col] = pd.to_datetime(df[timestamp_col], errors='coerce')
     df = df.dropna(subset=[timestamp_col])
     df['date'] = df[timestamp_col].dt.date
     trend_df = df.groupby(['date', cluster_col]).size().unstack(fill_value=0)
 
-    if cluster_names:
-        trend_df.columns = [cluster_names.get(i, f"Topic {i}") for i in trend_df.columns]
+    # Keep only top 10 clusters
+    top_clusters = trend_df.sum(axis=0).nlargest(10).index
+    trend_df = trend_df[top_clusters]
 
-    trend_df.plot(figsize=(15, 5), title="Topic Frequency Over Time")
+    # Rename columns using the name mapping
+    if cluster_names:
+        new_columns = [f"{cid}: {cluster_names.get(cid, f'Topic {cid}')}" for cid in top_clusters]
+        trend_df.columns = new_columns
+
+    # Plot
+    ax = trend_df.plot(figsize=(15, 5), title="Topic Frequency Over Time")
+    ax.set_yscale('log')
+    ax.legend(loc='upper left', bbox_to_anchor=(1.0, 1.0), title="Cluster")
     plt.xlabel("Date")
-    plt.ylabel("Comment Count")
+    plt.ylabel("Comment Count (log scale)")
+    plt.tight_layout()
     plt.grid(True)
     plt.show()
-
-def name_and_describe_clusters(cluster_keywords: Dict[int, List[str]]) -> Tuple[List[str], Dict[int, str]]:
-    """Heuristic-based topic naming without LLM."""
-    summaries = []
-    cluster_names = {}
-    for cluster_id, words in cluster_keywords.items():
-        name = " / ".join(words[:2]).title()
-        summary = (
-            f"\n### Topic {cluster_id}\n"
-            f"**Keywords**: {', '.join(words)}\n"
-            f"**Name**: {name}\n"
-            f"**Summary**: Comments related to '{name.lower()}', based on frequent word usage."
-        )
-        summaries.append(summary)
-        cluster_names[cluster_id] = name
-    return summaries, cluster_names
